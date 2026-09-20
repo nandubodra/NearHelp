@@ -5,6 +5,10 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const compression = require('compression');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
 const { Server } = require('socket.io');
 require('dotenv').config();
@@ -13,11 +17,16 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 const PORT = process.env.PORT || 3000;
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
 const JWT_SECRET = process.env.JWT_SECRET || 'nearhelp-demo-secret-change-me';
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'nearhelp.db');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'nearhelp-demo-secret-change-me') {
+  console.warn('Warning: JWT_SECRET is using the demo default. Set a real value in .env before production use.');
+}
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -160,8 +169,8 @@ async function initDb() {
 
   await seedDemoUsers();
 
-  const existingGuardians = await allQuery('SELECT * FROM guardians');
-  if (existingGuardians.length === 0) {
+  const guardians = await allQuery('SELECT * FROM guardians WHERE user_id IS NOT NULL');
+  if (guardians.length === 0) {
     const user = await getQuery('SELECT id FROM users WHERE email = ?', ['asha@nearhelp.app']);
     if (user) {
       await runQuery('INSERT INTO guardians (user_id, name, relation, status, created_at) VALUES (?, ?, ?, ?, ?)', [user.id, 'Meera Verma', 'Mother', 'online', new Date().toISOString()]);
@@ -185,8 +194,32 @@ async function initDb() {
   }
 }
 
-app.use(cors());
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(morgan('combined'));
+app.use(compression());
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts, please try again later.' }
+});
+
+app.use('/api/auth', authLimiter);
+app.use('/api', apiLimiter);
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/health', (req, res) => {
@@ -210,7 +243,7 @@ app.post('/api/auth/register', async (req, res) => {
       [String(name).trim(), cleanEmail, hash, role, new Date().toISOString()]
     );
 
-    const safeUser = { id: result.id, name: String(name).trim(), email: cleanEmail, role }; 
+    const safeUser = { id: result.id, name: String(name).trim(), email: cleanEmail, role };
     return res.json({ user: safeUser, token: signToken(safeUser) });
   } catch (error) {
     return res.status(500).json({ error: 'Registration failed', details: error.message });
